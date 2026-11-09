@@ -1,124 +1,251 @@
-"""Core encryption logic for SecureVault."""
+"""AES-GCM file encryption for SecureVault."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import hmac
+import io
 import os
 import secrets
+import struct
+import sys
+import tempfile
 from pathlib import Path
+from typing import BinaryIO
 
-MAGIC = b"SVLT1"
-VERSION = 1
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+MAGIC = b"SVLT2"
+VERSION = 2
 SALT_SIZE = 16
-NONCE_SIZE = 16
-DIGEST_SIZE = 32
-PBKDF2_ITERATIONS = 200_000
+NONCE_PREFIX_SIZE = 8
+NONCE_SIZE = 12
+TAG_SIZE = 16
+PBKDF2_ITERATIONS = 600_000
+CHUNK_SIZE = 1024 * 1024
+MAX_CHUNKS = (1 << 32) - 1
+HEADER = struct.Struct(">5sBI16s8sI")
+RECORD_LENGTH = struct.Struct(">I")
 
 
-def derive_key(password: str, salt: bytes) -> tuple[bytes, bytes]:
+def _derive_key(password: str, salt: bytes, iterations: int) -> bytes:
     if not password:
         raise ValueError("Password cannot be empty.")
-    expanded = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        PBKDF2_ITERATIONS,
-        dklen=64,
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iterations, dklen=32
     )
-    return expanded[:32], expanded[32:]
 
 
-def keystream(key: bytes, nonce: bytes, length: int) -> bytes:
-    if length <= 0:
-        return b""
-
-    output = bytearray()
-    counter = 0
-    while len(output) < length:
-        h = hashlib.sha256()
-        h.update(key)
-        h.update(nonce)
-        h.update(counter.to_bytes(8, byteorder="big", signed=False))
-        output.extend(h.digest())
-        counter += 1
-    return bytes(output[:length])
+def _nonce(prefix: bytes, counter: int) -> bytes:
+    if counter > MAX_CHUNKS:
+        raise ValueError("The file contains too many encryption chunks.")
+    return prefix + counter.to_bytes(4, byteorder="big")
 
 
-def encrypt_bytes(data: bytes, password: str) -> bytes:
+def _chunk_aad(header: bytes, kind: bytes, counter: int, length: int) -> bytes:
+    return header + kind + counter.to_bytes(4, byteorder="big") + length.to_bytes(
+        4, byteorder="big"
+    )
+
+
+def _read_exact(stream: BinaryIO, size: int) -> bytes:
+    result = bytearray()
+    while len(result) < size:
+        part = stream.read(size - len(result))
+        if not part:
+            raise ValueError("Encrypted file is truncated or malformed.")
+        result.extend(part)
+    return bytes(result)
+
+
+def _encrypt_stream(source: BinaryIO, destination: BinaryIO, password: str) -> None:
     if not password:
         raise ValueError("Password cannot be empty.")
 
     salt = secrets.token_bytes(SALT_SIZE)
-    nonce = secrets.token_bytes(NONCE_SIZE)
-    enc_key, mac_key = derive_key(password, salt)
+    nonce_prefix = secrets.token_bytes(NONCE_PREFIX_SIZE)
+    header = HEADER.pack(
+        MAGIC, VERSION, PBKDF2_ITERATIONS, salt, nonce_prefix, CHUNK_SIZE
+    )
+    cipher = AESGCM(_derive_key(password, salt, PBKDF2_ITERATIONS))
+    destination.write(header)
 
-    cipher = bytes(a ^ b for a, b in zip(data, keystream(enc_key, nonce, len(data))))
-    digest = hmac.new(mac_key, cipher + nonce, hashlib.sha256).digest()
+    counter = 0
+    while True:
+        plaintext = source.read(CHUNK_SIZE)
+        if not plaintext:
+            break
+        if counter >= MAX_CHUNKS:
+            raise ValueError("The file is too large to encrypt.")
 
-    return MAGIC + bytes([VERSION]) + salt + nonce + cipher + digest
+        aad = _chunk_aad(header, b"CHUNK", counter, len(plaintext))
+        encrypted = cipher.encrypt(_nonce(nonce_prefix, counter), plaintext, aad)
+        destination.write(RECORD_LENGTH.pack(len(plaintext)))
+        destination.write(encrypted)
+        counter += 1
+
+    final_aad = _chunk_aad(header, b"FINAL", counter, 0)
+    final_tag = cipher.encrypt(_nonce(nonce_prefix, counter), b"", final_aad)
+    destination.write(RECORD_LENGTH.pack(0))
+    destination.write(final_tag)
 
 
-def decrypt_bytes(data: bytes, password: str) -> bytes:
+def _decrypt_stream(source: BinaryIO, destination: BinaryIO, password: str) -> None:
     if not password:
         raise ValueError("Password cannot be empty.")
 
-    minimum_size = len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE + DIGEST_SIZE
-    if len(data) < minimum_size:
-        raise ValueError("This file is not a valid SecureVault encrypted file.")
-
-    if data[: len(MAGIC)] != MAGIC:
-        raise ValueError("Missing or invalid SecureVault header.")
-
-    version = data[len(MAGIC)]
+    header_bytes = _read_exact(source, HEADER.size)
+    magic, version, iterations, salt, nonce_prefix, chunk_size = HEADER.unpack(
+        header_bytes
+    )
+    if magic != MAGIC:
+        raise ValueError("Not a SecureVault AES-GCM encrypted file.")
     if version != VERSION:
         raise ValueError(f"Unsupported SecureVault version: {version}")
+    if iterations != PBKDF2_ITERATIONS:
+        raise ValueError("Unsupported key-derivation settings in encrypted file.")
+    if chunk_size != CHUNK_SIZE:
+        raise ValueError("Unsupported encryption chunk size.")
 
-    salt_start = len(MAGIC) + 1
-    nonce_start = salt_start + SALT_SIZE
-    ciphertext_start = nonce_start + NONCE_SIZE
-    ciphertext_end = len(data) - DIGEST_SIZE
+    cipher = AESGCM(_derive_key(password, salt, iterations))
+    counter = 0
 
-    salt = data[salt_start:nonce_start]
-    nonce = data[nonce_start:ciphertext_start]
-    ciphertext = data[ciphertext_start:ciphertext_end]
-    digest = data[-DIGEST_SIZE:]
+    while True:
+        record_length = RECORD_LENGTH.unpack(_read_exact(source, RECORD_LENGTH.size))[0]
+        if record_length == 0:
+            final_tag = _read_exact(source, TAG_SIZE)
+            final_aad = _chunk_aad(header_bytes, b"FINAL", counter, 0)
+            try:
+                cipher.decrypt(_nonce(nonce_prefix, counter), final_tag, final_aad)
+            except InvalidTag as exc:
+                raise ValueError(
+                    "Incorrect password or encrypted file is damaged."
+                ) from exc
+            if source.read(1):
+                raise ValueError("Unexpected data after encrypted file end marker.")
+            return
 
-    if len(nonce) != NONCE_SIZE:
-        raise ValueError("Encrypted file is missing valid nonce data.")
+        if record_length > chunk_size or counter >= MAX_CHUNKS:
+            raise ValueError("Invalid encrypted file chunk.")
 
-    enc_key, mac_key = derive_key(password, salt)
-    expected_digest = hmac.new(mac_key, ciphertext + nonce, hashlib.sha256).digest()
-    if not hmac.compare_digest(digest, expected_digest):
-        raise ValueError("Incorrect password or corrupted file.")
+        encrypted = _read_exact(source, record_length + TAG_SIZE)
+        aad = _chunk_aad(header_bytes, b"CHUNK", counter, record_length)
+        try:
+            plaintext = cipher.decrypt(
+                _nonce(nonce_prefix, counter), encrypted, aad
+            )
+        except InvalidTag as exc:
+            raise ValueError(
+                "Incorrect password or encrypted file is damaged."
+            ) from exc
+        destination.write(plaintext)
+        counter += 1
 
-    plaintext = bytes(a ^ b for a, b in zip(ciphertext, keystream(enc_key, nonce, len(ciphertext))))
-    return plaintext
+
+def encrypt_bytes(data: bytes, password: str) -> bytes:
+    source = io.BytesIO(data)
+    destination = io.BytesIO()
+    _encrypt_stream(source, destination, password)
+    return destination.getvalue()
 
 
-def encrypt_file(input_path: str | os.PathLike[str], output_path: str | os.PathLike[str], password: str) -> Path:
-    source = Path(input_path)
+def decrypt_bytes(data: bytes, password: str) -> bytes:
+    source = io.BytesIO(data)
+    destination = io.BytesIO()
+    _decrypt_stream(source, destination, password)
+    return destination.getvalue()
+
+
+def _same_path(source: Path, destination: Path) -> bool:
+    return source.resolve() == destination.resolve()
+
+
+def _write_file_atomically(
+    source_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    password: str,
+    operation: str,
+) -> Path:
+    source = Path(source_path)
     destination = Path(output_path)
-    destination.write_bytes(encrypt_bytes(source.read_bytes(), password))
-    return destination
+    if not source.is_file():
+        raise ValueError(f"Input is not a file: {source}")
+    if _same_path(source, destination):
+        raise ValueError("Input and output paths must be different.")
+    if not destination.parent.is_dir():
+        raise ValueError(f"Output directory does not exist: {destination.parent}")
+
+    temporary_path: str | None = None
+    try:
+        with source.open("rb") as input_stream:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as output_stream:
+                temporary_path = output_stream.name
+                if operation == "encrypt":
+                    _encrypt_stream(input_stream, output_stream, password)
+                else:
+                    _decrypt_stream(input_stream, output_stream, password)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        return destination
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
 
 
-def decrypt_file(input_path: str | os.PathLike[str], output_path: str | os.PathLike[str], password: str) -> Path:
-    source = Path(input_path)
-    destination = Path(output_path)
-    destination.write_bytes(decrypt_bytes(source.read_bytes(), password))
-    return destination
+def encrypt_file(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    password: str,
+) -> Path:
+    return _write_file_atomically(input_path, output_path, password, "encrypt")
+
+
+def decrypt_file(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    password: str,
+) -> Path:
+    return _write_file_atomically(input_path, output_path, password, "decrypt")
 
 
 def build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SecureVault: encrypt and decrypt files.")
-    parser.add_argument("action", nargs="?", choices=["encrypt", "decrypt", "e", "d"], help="Operation to perform.")
+    parser = argparse.ArgumentParser(
+        description="SecureVault: encrypt and decrypt files with AES-GCM."
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["encrypt", "decrypt", "e", "d"],
+        help="Operation to perform.",
+    )
     parser.add_argument("input_file", nargs="?", help="Input file path.")
     parser.add_argument("output_file", nargs="?", help="Output file path.")
-    parser.add_argument("-k", "--key", "--password", dest="password", help="Password used to encrypt or decrypt the file.")
-    parser.add_argument("-e", "--encrypt", dest="encrypt_flag", action="store_true", help="Encrypt the input file.")
-    parser.add_argument("-d", "--decrypt", dest="decrypt_flag", action="store_true", help="Decrypt the input file.")
+    parser.add_argument(
+        "-k",
+        "--key",
+        "--password",
+        dest="password",
+        help="Password (if omitted, SecureVault prompts without displaying it).",
+    )
+    parser.add_argument(
+        "-e", "--encrypt", dest="encrypt_flag", action="store_true", help="Encrypt."
+    )
+    parser.add_argument(
+        "-d", "--decrypt", dest="decrypt_flag", action="store_true", help="Decrypt."
+    )
     return parser
 
 
@@ -142,18 +269,22 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     if not args.input_file or not args.output_file:
         parser.error("Both input_file and output_file are required.")
-    if not args.password:
-        parser.error("A password is required via --key/-k.")
+
+    password = args.password
+    if password is None:
+        import getpass
+
+        password = getpass.getpass("Password: ")
 
     try:
         if mode == "encrypt":
-            encrypt_file(args.input_file, args.output_file, args.password)
+            encrypt_file(args.input_file, args.output_file, password)
             print(f"Encrypted: {args.input_file} -> {args.output_file}")
         else:
-            decrypt_file(args.input_file, args.output_file, args.password)
+            decrypt_file(args.input_file, args.output_file, password)
             print(f"Decrypted: {args.input_file} -> {args.output_file}")
-    except Exception as exc:
-        print(f"Error: {exc}", file=os.sys.stderr)
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     return 0

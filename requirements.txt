@@ -1,2 +1,1 @@
-# No external dependencies required for the default app.
-# Tkinter is included with the official Python installer for Windows/macOS.
+cryptography>=42.0.0

@@ -66,7 +66,11 @@ class SecureVaultApp(tk.Tk):
             self.input_path.set(path)
             if not self.output_path.get():
                 target = Path(path)
-                self.output_path.set(str(target.parent / f"{target.stem}.securevault"))
+                if target.suffix.lower() == ".securevault":
+                    output = target.with_suffix("")
+                else:
+                    output = target.with_name(f"{target.name}.securevault")
+                self.output_path.set(str(output))
 
     def choose_output_file(self) -> None:
         path = filedialog.asksaveasfilename(title="Choose output location")
@@ -87,6 +91,10 @@ class SecureVaultApp(tk.Tk):
         if not password:
             messagebox.showerror("Error", "Please enter a password.")
             return
+        if os.path.exists(destination) and not messagebox.askyesno(
+            "Overwrite file?", f"The output file already exists:\n{destination}\n\nReplace it?"
+        ):
+            return
 
         try:
             if mode == "encrypt":
@@ -96,7 +104,7 @@ class SecureVaultApp(tk.Tk):
                 decrypt_file(source, destination, password)
                 self.status.set(f"Decrypted: {source} -> {destination}")
             messagebox.showinfo("Success", f"Operation completed successfully: {mode.upper()}.")
-        except Exception as exc:  # pragma: no cover - GUI error handling
+        except (OSError, ValueError) as exc:  # pragma: no cover - GUI error handling
             self.status.set(f"Error: {exc}")
             messagebox.showerror("Error", str(exc))
 
